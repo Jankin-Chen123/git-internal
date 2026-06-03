@@ -86,6 +86,7 @@ pub struct PackStats {
     pub trees: usize,
     pub blobs: usize,
     pub tags: usize,
+    /// Objects that were stored as delta entries in the pack and resolved by decode.
     pub deltas: usize,
 }
 
@@ -948,6 +949,25 @@ mod tests {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         let stats = Pack::stats_from_path(fixture_path("tests/data/packs/small-sha1.pack"))
             .expect("small pack stats should decode");
+
+        assert_eq!(
+            stats,
+            PackStats {
+                total: 19,
+                commits: 2,
+                trees: 2,
+                blobs: 15,
+                tags: 0,
+                deltas: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_pack_stats_from_path_counts_sha256_pack() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha256);
+        let stats = Pack::stats_from_path(fixture_path("tests/data/packs/small-sha256.pack"))
+            .expect("small sha256 pack stats should decode");
 
         assert_eq!(
             stats,
