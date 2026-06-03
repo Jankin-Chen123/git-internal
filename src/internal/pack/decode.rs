@@ -2,10 +2,11 @@
 //! and populates caches/metadata for downstream consumers.
 
 use std::{
+    fs,
     io::{self, BufRead, Cursor, ErrorKind, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -77,6 +78,34 @@ struct SharedParams {
     pub callback: Arc<dyn Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send>,
 }
 
+/// Summary of the final object distribution decoded from a pack file.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PackStats {
+    pub total: usize,
+    pub commits: usize,
+    pub trees: usize,
+    pub blobs: usize,
+    pub tags: usize,
+    pub deltas: usize,
+}
+
+impl PackStats {
+    fn record(&mut self, entry: &MetaAttached<Entry, EntryMeta>) {
+        self.total += 1;
+        if entry.meta.is_delta.unwrap_or(false) {
+            self.deltas += 1;
+        }
+
+        match entry.inner.obj_type {
+            ObjectType::Commit => self.commits += 1,
+            ObjectType::Tree => self.trees += 1,
+            ObjectType::Blob => self.blobs += 1,
+            ObjectType::Tag => self.tags += 1,
+            _ => {}
+        }
+    }
+}
+
 impl Drop for Pack {
     fn drop(&mut self) {
         if self.clean_tmp {
@@ -127,6 +156,31 @@ impl Pack {
             cache_objs_mem: Arc::new(AtomicUsize::default()),
             clean_tmp,
         }
+    }
+
+    /// Decode a pack file and return its object type distribution.
+    pub fn stats_from_path(path: impl AsRef<Path>) -> Result<PackStats, GitError> {
+        let file = fs::File::open(path)?;
+        let mut reader = io::BufReader::new(file);
+        let mut pack = Pack::new(Some(2), Some(64 * 1024 * 1024), None, true);
+
+        let stats = Arc::new(Mutex::new(PackStats::default()));
+        let stats_for_callback = stats.clone();
+        pack.decode(
+            &mut reader,
+            move |entry| {
+                let mut guard = stats_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.record(&entry);
+            },
+            None::<fn(ObjectHash)>,
+        )?;
+
+        let guard = stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(*guard)
     }
 
     /// Checks and reads the header of a Git pack file.
@@ -809,8 +863,9 @@ mod tests {
     use tokio_util::io::ReaderStream;
 
     use crate::{
+        errors::GitError,
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
-        internal::pack::{Pack, tests::init_logger},
+        internal::pack::{Pack, decode::PackStats, tests::init_logger},
     };
 
     #[tokio::test]
@@ -880,6 +935,53 @@ mod tests {
     fn test_pack_decode_without_delta() {
         run_decode_no_delta("tests/data/packs/small-sha1.pack", HashKind::Sha1);
         run_decode_no_delta("tests/data/packs/small-sha256.pack", HashKind::Sha256);
+    }
+
+    fn fixture_path(rel_path: &str) -> PathBuf {
+        let mut source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        source.push(rel_path);
+        source
+    }
+
+    #[test]
+    fn test_pack_stats_from_path_counts_small_pack() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let stats = Pack::stats_from_path(fixture_path("tests/data/packs/small-sha1.pack"))
+            .expect("small pack stats should decode");
+
+        assert_eq!(
+            stats,
+            PackStats {
+                total: 19,
+                commits: 2,
+                trees: 2,
+                blobs: 15,
+                tags: 0,
+                deltas: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_pack_stats_from_path_counts_delta_entries() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let stats = Pack::stats_from_path(fixture_path("tests/data/packs/medium-sha1.pack"))
+            .expect("medium pack stats should decode");
+
+        assert_eq!(stats.total, 35_031);
+        assert_eq!(stats.commits, 7);
+        assert_eq!(stats.trees, 14);
+        assert_eq!(stats.blobs, 35_010);
+        assert_eq!(stats.tags, 0);
+        assert_eq!(stats.deltas, 22_339);
+    }
+
+    #[test]
+    fn test_pack_stats_from_path_reports_missing_file() {
+        let missing = fixture_path("tests/data/packs/does-not-exist.pack");
+        let err = Pack::stats_from_path(missing).expect_err("missing pack should fail");
+
+        assert!(matches!(err, GitError::IOError(_)));
     }
 
     /// Helper function to run decode tests with delta objects
